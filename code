@@ -1,0 +1,544 @@
+// Code available @ https://code.earthengine.google.com/3e5e9174dca44670836cffb8d00d4d5b
+
+// Select year of analysis
+var yearOfAnalysis = 2018
+
+// Period of anomaly detection
+var startyear_2 = yearOfAnalysis  
+var endyear_2 = yearOfAnalysis  
+var start_date_2 = ee.Date.fromYMD(startyear_2, 1, 1) 
+var end_date_2 = ee.Date.fromYMD(endyear_2 + 1, 1, 1) 
+
+
+// File format and labels
+var fileFormat = 'CSV' // SHP, GEOJSON or CSV  
+
+// Period of long-term mean calculation 
+var startyear_1 = 1997   
+var endyear_1 = 2017  
+var start_date = ee.Date.fromYMD(startyear_1, 1, 1) 
+var end_date = ee.Date.fromYMD(endyear_1 + 1, 1, 1) 
+
+
+
+// Scale of analysis in m 
+var scale = 100
+
+// Area of Interest
+
+var aoi = ee.Geometry.Polygon(
+        [[[31, 6],
+          [31, -1], 
+          [39, -1],
+          [39, 6]]], null, false) 
+      
+      
+          
+// ACLED DATA PROCESSING
+
+// Filter ACLED data by year of analysis
+var filtered = acled.filter(ee.Filter.eq('YEAR', yearOfAnalysis))
+print(filtered, 'ALCED Pastoral Conflict')
+
+// Create an empty Feature collection to fill with data later      
+var allMonthsData = ee.FeatureCollection([]) 
+  
+// Access datasets for environmental variables
+
+// CHIRPS PENTAD Dataset for Precipitation 
+var chirps = ee.ImageCollection("UCSB-CHG/CHIRPS/PENTAD").filterBounds(aoi)  
+
+// Population density 
+var popDensity = ee.ImageCollection('projects/sat-io/open-datasets/ORNL/LANDSCAN_GLOBAL').filterBounds(aoi)
+var popDensity = popDensity.filterDate(start_date_2, end_date_2)
+var popDensity = popDensity.first().rename('popDens')
+
+// Land Surface Temperature
+var temperature = ee.ImageCollection('JAXA/GCOM-C/L3/LAND/LST/V3')
+                      .filterBounds(aoi)
+                      .filter(ee.Filter.eq('SATELLITE_DIRECTION', 'D')) 
+
+// Landsat collections 
+var LT05 = ee.ImageCollection('LANDSAT/LT05/C02/T1_L2').filterBounds(aoi) // 1984-03-16T16:18:01Z–2012-05-05T17:54:06
+var LE07 = ee.ImageCollection('LANDSAT/LE07/C02/T1_L2').filterBounds(aoi) // 1999-05-28T01:02:17Z–2023-04-21T00:10:55
+var LC08 = ee.ImageCollection('LANDSAT/LC08/C02/T1_L2').filterBounds(aoi) // 2013-03-18T15:58:14Z–2023-05-08T22:54:37
+
+//----------------------- Landsat pre-processing steps---------------------------------------------------
+
+// Function to apply cloud masking
+function maskL457sr(image) {
+  // Bit 0 - Fill
+  // Bit 1 - Dilated Cloud
+  // Bit 2 - Unused
+  // Bit 3 - Cloud
+  // Bit 4 - Cloud Shadow
+  var qaMask = image.select('QA_PIXEL').bitwiseAnd(parseInt('11111', 2)).eq(0) 
+  var saturationMask = image.select('QA_RADSAT').eq(0) 
+
+  // Apply the scaling factors to the appropriate bands.
+  var opticalBands = image.select('SR_B.').multiply(0.0000275).add(-0.2) 
+  var thermalBand = image.select('ST_B6').multiply(0.00341802).add(149.0) 
+
+  // Replace the original bands with the scaled ones and apply the masks.
+  return image.addBands(opticalBands, null, true)
+      .addBands(thermalBand, null, true)
+      .updateMask(qaMask)
+      .updateMask(saturationMask) 
+}
+
+
+function maskL8sr(image) {
+  // Bits 3 and 5 are cloud shadow and cloud, respectively.
+  var cloudShadowBitMask = 1 << 3 
+  var cloudsBitMask = 1 << 5 
+  // Get the pixel QA band.
+  var qa = image.select('QA_PIXEL') 
+  // Both flags should be set to zero, indicating clear conditions.
+  var mask = qa.bitwiseAnd(cloudShadowBitMask).eq(0)
+      .and(qa.bitwiseAnd(cloudsBitMask).eq(0)) 
+  // Return the masked image, scaled to reflectance, without the QA bands.
+  return image.updateMask(mask).divide(10000)
+      .select("SR_B[0-9]*")
+      .copyProperties(image, ["system:time_start"]) 
+}
+
+var LT05 = LT05.map(maskL457sr)
+var LE07 = LE07.map(maskL457sr)
+var LC08 = LC08.map(maskL8sr)
+
+// Rename bands 
+var bandsLE07 = ['SR_B1', 'SR_B2', 'SR_B3','SR_B4']
+var bandsLT05 =  ['SR_B1', 'SR_B2', 'SR_B3','SR_B4']
+var bandsLC08 =  ['SR_B2', 'SR_B3', 'SR_B4','SR_B5']
+
+var newBandNames = ['B','G','R', 'NIR']
+
+var LT05 = LT05.select(bandsLT05,newBandNames)
+var LE07 = LE07.select(bandsLE07,newBandNames)
+var LC08 = LC08.select(bandsLC08,newBandNames)
+
+var L578 = LT05.merge(LE07).merge(LC08)
+
+var col = L578 
+
+Map.centerObject(aoi,10)
+
+// LONG TERM MONTHLY MEAN for LST, NDVI and Precipitation-------------------------------------------------------------------------
+
+
+// Filter by date
+var col_filtered = col.filterDate(start_date, end_date)
+var chirps_filtered = chirps.filterDate(start_date, end_date)
+var temp = temperature.filterDate(start_date, end_date)
+
+// Calculate NDVI from Landsat collection
+var addNDVI_L578 = function(image) {
+  return image.normalizedDifference(['NIR', 'R']).rename('NDVI')
+  .copyProperties(image, ["system:time_start"]) 
+} 
+
+var col_ndvi = col_filtered.map(addNDVI_L578) 
+
+//Select relevant bands from all collections
+var col_ndvi =col_ndvi.select('NDVI')
+var col_p =chirps_filtered.select('precipitation')
+var temp = temp.select('LST_AVE')
+
+// make a list with years
+var years = ee.List.sequence(startyear_1, endyear_1) 
+// make a list with months
+var months = ee.List.sequence(1, 12) 
+
+// Calculate monthly values for NDVI
+var monthlyNDVI =  ee.ImageCollection.fromImages(
+  years.map(function (y) {
+    return months.map(function(m) {
+      var w = col_ndvi.filter(ee.Filter.calendarRange(y, y, 'year'))
+                    .filter(ee.Filter.calendarRange(m, m, 'month'))
+                    .mean() 
+      return w.set('year', y)
+              .set('month', m)
+              .set('system:time_start', ee.Date.fromYMD(y, m, 1))
+              
+    }) 
+  }).flatten()
+) 
+
+var meanMonthlyNDVI_1 = monthlyNDVI
+
+// Calculate monthly values for LST
+var monthlyTemp =  ee.ImageCollection.fromImages(
+  years.map(function (y) {
+    return months.map(function(m) {
+      var w = temp.filter(ee.Filter.calendarRange(y, y, 'year'))
+                    .filter(ee.Filter.calendarRange(m, m, 'month'))
+                    .mean() 
+      return w.set('year', y)
+              .set('month', m)
+              .set('system:time_start', ee.Date.fromYMD(y, m, 1)) 
+                        
+    }) 
+  }).flatten()
+) 
+var meanMonthlyTemp_1 = monthlyTemp
+
+//Calculate monthly sum for precipitation
+var monthlyPrecip =  ee.ImageCollection.fromImages(
+  years.map(function (y) {
+    return months.map(function(m) {
+      var w = col_p.filter(ee.Filter.calendarRange(y, y, 'year'))
+                    .filter(ee.Filter.calendarRange(m, m, 'month'))
+                    .sum() 
+      return w.set('year', y)
+              .set('month', m)
+              .set('system:time_start', ee.Date.fromYMD(y, m, 1)) 
+                        
+    }) 
+  }).flatten()
+) 
+
+// Calculate the mean of the monthly sum
+var meanMonthlyP_1 =  ee.ImageCollection.fromImages(
+  months.map(function (m) {
+    var w = monthlyPrecip.filter(ee.Filter.eq('month', m)).mean() 
+    return w.set('month', m)
+            .set('system:time_start',ee.Date.fromYMD(1, m, 1))  
+  }).flatten()
+) 
+print(meanMonthlyP_1)
+
+// Create a chart to visualize the long-term monthly mean of NDVI
+var chart =
+    ui.Chart.image
+        .series({
+          imageCollection: meanMonthlyNDVI_1,
+          region:aoi,
+          reducer: ee.Reducer.mean(),
+          scale: 500,
+          xProperty: 'month',
+          
+        })
+        .setSeriesNames(['NDVI'])
+        .setOptions({
+          title: 'Monthly NDVI average '+startyear_1+"-"+endyear_1,
+          hAxis: {title: 'Date', titleTextStyle: {italic: false, bold: true}},
+          vAxis: {
+            title: 'NDVI',
+            titleTextStyle: {italic: false, bold: true}
+          },
+          lineWidth: 5,
+          colors: ['e37d05', '1d6b99'],
+          curveType: 'function'
+        })
+        .setChartType('ColumnChart') 
+print(chart) 
+
+print(meanMonthlyNDVI_1,'Mean Monthly NDVI') 
+
+/// YEAR OF ANALYSIS -----------------------------------------------------
+
+// ---------------Sentinel-2 and PROBA-V Preprocessing -----------------------------------------
+// For 2018 PROBA-V 
+var probv = ee.ImageCollection("VITO/PROBAV/C1/S1_TOC_100M")
+// NDVI function for PROBA-V
+var addNDVI_probv = function(image) {
+  return image.normalizedDifference(['NIR', 'RED']).rename('NDVI')
+  .copyProperties(image, ["system:time_start"]) 
+} 
+
+// For 2019-2023 Sentinel-2
+var S2 =ee.ImageCollection("COPERNICUS/S2_SR_HARMONIZED")
+
+// NDVI function for Sentinel-2
+var addNDVI_S2 = function(image) {
+  return image.normalizedDifference(['B8', 'B4']).rename('NDVI')
+  .copyProperties(image, ["system:time_start"]) 
+} 
+
+// Cloud masking for Sentinel-2
+function maskS2clouds(image) {
+  var qa = image.select('QA60') 
+  var cloudBitMask = 1 << 10 
+  var cirrusBitMask = 1 << 11 
+  var mask = qa.bitwiseAnd(cloudBitMask).eq(0).and(
+             qa.bitwiseAnd(cirrusBitMask).eq(0)) 
+  return image.updateMask(mask).divide(10000)
+      .select("B.*")
+      .copyProperties(image, ["system:time_start"]) 
+}
+
+if (startyear_2 <2019){
+  
+  var col_2 =probv.filterDate(start_date_2, end_date_2)
+  var addNDVI = addNDVI_probv
+}
+
+else if(startyear_2 >= 2019){
+  var addNDVI = addNDVI_S2
+  var col_2_masked =S2.filterDate(start_date_2, end_date_2)
+  var col_2 = col_2_masked.map(maskS2clouds)
+}
+
+var col_2_ndvi = col_2.map(addNDVI)
+var col_2 = col_2_ndvi.select('NDVI')
+var col_chirps_2 =chirps.filterDate(start_date_2, end_date_2)
+var col_chirps_2 = col_chirps_2.select('precipitation')
+
+var col_temp_2 = temperature.filterDate(start_date_2, end_date_2)
+var col_temp_2 = col_temp_2.select('LST_AVE')
+
+// make a list with years
+var years = ee.List.sequence(startyear_2, endyear_2) 
+// make a list with months
+var months = ee.List.sequence(1, 12) 
+
+// Calculate monthly values for NDVI
+var monthlyNDVI_2 =  ee.ImageCollection.fromImages(
+  years.map(function (y) {
+    return months.map(function(m) {
+      var w = col_2.filter(ee.Filter.calendarRange(y, y, 'year'))
+                    .filter(ee.Filter.calendarRange(m, m, 'month'))
+                    .mean() 
+      return w.set('year', y)
+              .set('month', m)
+              .set('system:time_start', ee.Date.fromYMD(y, m, 1)) 
+                        
+    }) 
+  }).flatten()
+) 
+
+// Monthly values for LST
+var meanMonthlyTemp_2 =  ee.ImageCollection.fromImages(
+  years.map(function (y) {
+    return months.map(function(m) {
+      var w = col_temp_2.filter(ee.Filter.calendarRange(y, y, 'year'))
+                    .filter(ee.Filter.calendarRange(m, m, 'month'))
+                    .mean() 
+      return w.set('year', y)
+              .set('month', m)
+              .set('system:time_start', ee.Date.fromYMD(y, m, 1)) 
+                        
+    }) 
+  }).flatten()
+) 
+print(meanMonthlyTemp_2,'Monthly t')
+
+//Monthly Precipitation
+var monthlyPrecip_2 =  ee.ImageCollection.fromImages(
+  years.map(function (y) {
+    return months.map(function(m) {
+      var w = col_chirps_2.filter(ee.Filter.calendarRange(y, y, 'year'))
+                    .filter(ee.Filter.calendarRange(m, m, 'month'))
+                    .sum() 
+      return w.set('year', y)
+              .set('month', m)
+              .set('system:time_start', ee.Date.fromYMD(y, m, 1)) 
+                        
+    }) 
+  }).flatten()
+) 
+
+var meanMonthlyP_2 =  ee.ImageCollection.fromImages(
+  months.map(function (m) {
+    var w = monthlyPrecip_2.filter(ee.Filter.eq('month', m)).mean() 
+    return w.set('month', m)
+            .set('system:time_start',ee.Date.fromYMD(1, m, 1))  
+  }).flatten()
+) 
+
+// Chart of monthly NDVI mean in year of analysis
+var chart =
+    ui.Chart.image
+        .series({
+          imageCollection: monthlyNDVI_2,
+          region: aoi,
+          reducer: ee.Reducer.mean(),
+          scale: 500,
+          xProperty: 'month'
+        })
+        .setSeriesNames(['NDVI'])
+        .setOptions({
+          title: 'Monthly NDVI average '+startyear_2,
+          hAxis: {title: 'Date', titleTextStyle: {italic: false, bold: true}},
+          vAxis: {
+            title: 'NDVI',
+            titleTextStyle: {italic: false, bold: true}
+          },
+          lineWidth: 5,
+          colors: ['e37d05', '1d6b99'],
+          curveType: 'function'
+        })
+        .setChartType('ColumnChart') 
+print(chart) 
+var meanMonthlyNDVI_2 = monthlyNDVI_2
+
+
+/// Monthly anomaly detection 
+
+//Check data availability for long-term and year of analysis
+var list1 = meanMonthlyNDVI_1 
+print(list1,'LIST1')
+var list2 = meanMonthlyNDVI_2 
+print(list2,'LIST2')
+
+// Reproject to 100 m scale
+var list1 = list1.map(function(image) {
+  return image.reproject({
+    crs: list1.first().projection(),
+    scale: scale
+  }) 
+}) 
+
+var list2 = list2.map(function(image) {
+  return image.reproject({
+    crs: list2.first().projection(),
+    scale: scale
+  }) 
+}) 
+
+// Precipitation
+var list1_P = meanMonthlyP_1 
+var list2_P = meanMonthlyP_2 
+// Reproject to 100 m scale
+var list1_P = list1_P.map(function(image) {
+  return image.reproject({
+    crs: list1_P.first().projection(),
+    scale: scale
+  }) 
+}) 
+var list2_P = list2_P.map(function(image) {
+  return image.reproject({
+    crs: list2_P.first().projection(),
+    scale: scale
+  }) 
+}) 
+
+// Temperature
+var list1_T = meanMonthlyTemp_1 
+var list2_T = meanMonthlyTemp_2 
+
+// Reproject to 100 m scale
+var list1_T = list1_T.map(function(image) {
+  return image.reproject({
+    crs: list1_P.first().projection(),
+    scale: scale
+  }) 
+}) 
+
+var list2_T = list2_T.map(function(image) {
+  return image.reproject({
+    crs: list2_P.first().projection(),
+    scale: scale
+  }) 
+}) 
+
+// Assign all values (conflict and other variables) to each grid cell per month
+for (var i = 1; i < 13; i++){
+  
+//Environmental variables ----------------------------------------------------  
+    //Anomaly prep, longterm average (labeled as "pre")
+    var pre_image = list1.filter(ee.Filter.eq('month',i))
+    var pre_image_p = list1_P.filter(ee.Filter.eq('month',i))
+    var pre_image = pre_image.mean()
+    var pre_image_p = pre_image_p.mean()
+    var pre_image = pre_image.clip(aoi)
+    
+    //Image for year of analysis for each month (labeled as "post")
+    var post_image = list2.filter(ee.Filter.eq('month',i))
+    var post_image_p = list2_P.filter(ee.Filter.eq('month',i))
+    var post_image_t = list2_T.filter(ee.Filter.eq('month',i))
+    
+    // Mean image of year of analysis
+    var post_image = post_image.mean()
+    var post_image_p = post_image_p.mean()
+    var post_image_t = post_image_t.mean()
+    
+    //Anomaly calculation
+    var post_image = post_image.clip(aoi)
+    var difference_ndvi = post_image.subtract(pre_image).rename('NDVI_anomaly')
+    var difference_p = post_image_p.subtract(pre_image_p).rename('precipitation_anomaly')
+    var post_t = post_image_t
+    
+    //Select bands
+    var bands = difference_p.addBands(difference_ndvi).addBands(post_t).addBands(post_image).addBands(post_image_p).addBands(popDensity.select('popDens'))
+    print(bands,'bands')
+// Conflict data ---------------------------------------------------------------
+    // Select monthly ACLED data
+    var acled_monthly = filtered.filter(ee.Filter.eq('EVENT_DATE',i))
+    
+    // Extract geometry from ACLED data
+    var acled_geom = acled_monthly.geometry()
+    
+   //Convert grid into feature collection
+    var grid_fc = ee.FeatureCollection(grid)
+    
+    //Visualize Monthly ACLED Events per grid cell 
+    Map.addLayer(acled_geom,{}, 'ACLED data '+i,false) 
+    Map.addLayer(grid_fc,{},'Grid cells with Pastoral conflicts '+yearOfAnalysis +'-'+i,false)
+    
+    // Count Fatalities per grid cell per month
+    var countFatalities= function(grid_fc) {
+        var fatalities = acled_monthly
+                        .filterBounds(grid_fc.geometry())
+                        .aggregate_sum('FATALITIES')
+            return grid_fc.set('fatalities', fatalities) 
+      
+    }
+    
+    // Count conflict events per grid cell per month
+    var countPoints = function(grid_fc) {
+        var pointsWithinPolygon = acled_monthly.filterBounds(grid_fc.geometry()) 
+        var count = pointsWithinPolygon.size() 
+          return grid_fc.set('conflictCount', count) 
+      } 
+    
+    // Count lethal conflict events per grid cell per month
+    var countLethalConflicts = function(grid_fc){
+        var lethalConflicts = acled_monthly
+                          .filterBounds(grid_fc.geometry())
+                          .filter(ee.Filter.gt('FATALITIES',0))
+        var count = lethalConflicts.size() 
+           return grid_fc.set('lethalConflicts', count)
+}
+   
+// Map the counting functions over the polygons FeatureCollection
+    var withCounts = grid_fc.map(countPoints)
+                            .map(countFatalities)
+                            .map(countLethalConflicts)
+
+// Add the environmental data to the grid ------------------------------
+    var environment_vars = bands
+
+// Define a reudcer that includes mean and standard deviation
+    var reducer = ee.Reducer.mean().combine({
+      reducer2: ee.Reducer.stdDev(),
+      sharedInputs: true
+}) 
+
+// Calculate statistics of the environmental variables in each cell
+    var multiStats_cell = environment_vars.reduceRegions({
+      collection: withCounts,
+      reducer: reducer,
+      scale: scale,
+}) 
+
+// Resulting grid with all variables statistics
+    var resultCollection = multiStats_cell 
+
+// Add property of month to each grid cell
+  var processedDataWithMonth = resultCollection.map(function(feature) {
+    return feature.set('month', i)
+  }) 
+
+
+  // Accumulate the data for all months using the empty feature collection created previously outside the for-loop
+  allMonthsData = allMonthsData.merge(processedDataWithMonth) 
+  print(allMonthsData,'allMonthsData within Loop '+i)
+
+}
+// Export data ----------------------------------------------------
+Export.table.toDrive({
+  collection:allMonthsData, 
+  description:fileFormat+"_NDVI_CHIRPS_ACLED_"+yearOfAnalysis, 
+  folder:fileFormat+'_NDVI_CHIRPS_ACLED',
+  fileFormat:fileFormat}) 
